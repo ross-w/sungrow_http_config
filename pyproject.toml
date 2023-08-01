@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sungrow_http_config"
+version = "0.0.1"
+dependencies = [
+  "requests_retry_on_exceptions",
+  "logging",
+  "json",
+  "urllib3",
+]
+authors = [
+  { name="Ross Williamson", email="ross@inertia.net.nz" },
+]
+description = "A package to manipulate settings on Sungrow Inverters"
+readme = "README.md"
+requires-python = ">=3.7"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+"Homepage" = "https://github.com/ross-w/sungrow_exportlimit"
+"Bug Tracker" = "https://github.com/ross-w/sungrow_exportlimit/issues"
