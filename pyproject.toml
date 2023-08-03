@@ -8,6 +8,7 @@ version = "0.0.4"
 dependencies = [
   "requests_retry_on_exceptions",
   "urllib3",
+  "pymodbus"
 ]
 authors = [
   { name="Ross Williamson", email="ross@inertia.net.nz" },
