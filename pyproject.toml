@@ -4,11 +4,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sungrow_http_config"
-version = "0.0.1"
+version = "0.0.4"
 dependencies = [
   "requests_retry_on_exceptions",
-  "logging",
-  "json",
   "urllib3",
 ]
 authors = [

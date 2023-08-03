@@ -3,6 +3,11 @@ import requests_retry_on_exceptions as requests
 import json
 import urllib3
 import logging
+import codecs as c
+from pymodbus.constants import Endian
+from pymodbus.payload import BinaryPayloadDecoder
+import pymodbus.register_write_message as modbus_register_write
+from pymodbus.transaction import ModbusRtuFramer
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -131,10 +136,32 @@ class SungrowHttpConfig():
             "token": self.token
         }
         resp = self._callAPI("/device/passthroughway", req)
+        if not resp.get("result_code")==1:
+            raise Exception("Got unsuccessful message back from device: {resp}".format(resp=resp))
         return resp.get("result_data")
 
-    def setZeroExportLimit(self):
+    def _generateExportLimitCommand(self, dekawattLimit):
+        """ Generates the appropriate modbus command to send for the given limit
+        :param dekawattLimit: Limit to set, in dekawatts (kW * 100)
+        :returns: String containing modbus command string
+        """
+        framer = ModbusRtuFramer(None)
+        arguments = {
+            "address": 31221,
+            "value": dekawattLimit,
+            "write_address": 31221,
+            "transaction": 1,
+            "slave": 1,
+            "protocol": 0x00,
+        }
+        message = modbus_register_write.WriteSingleRegisterRequest(**arguments)
+        raw_packet = framer.buildPacket(message)
+        packet = c.encode(raw_packet, "hex_codec").decode("utf-8").upper()
+        return packet
+
+    def setExportLimit(self, dekawattLimit):
         """ Enable export limit and set to 0kW (zero export limit)
+        :param dekawattLimit: Limit to set, in dekawatts (kW * 100). Note 0 == unlimited, so set 1 for 0.01kW
         :returns: True if successful
         """
 
@@ -146,12 +173,14 @@ class SungrowHttpConfig():
             logging.warning("Problem enabling feed-in limitation")
             return False
 
-        msg2 = self._sendHexMessageToDevice("011079F5000306000003E80000F77E") # Set limit to 0kW
+        exportLimitCommand = self._generateExportLimitCommand(dekawattLimit)
+        logging.debug("Generated modbus export limit command as {command}".format(command=exportLimitCommand))
+        msg2 = self._sendHexMessageToDevice(exportLimitCommand) # Set limit
         msg2resp = msg2.get("data")
-        if msg2resp == "011079F500038966":
-            logging.debug("Feed-in limitation set at 0kW")
+        if msg2resp == exportLimitCommand:
+            logging.debug("Feed-in limitation set at {power}kW".format(power=dekawattLimit/100))
         else:
-            logging.warning("Problem setting feed-in limitation to 0kW")
+            logging.warning("Problem setting feed-in limitation to {power}kW, modbus response was {resp}".format(power=dekawattLimit/100,resp=msg2resp))
             return False
         return True
 
@@ -167,3 +196,30 @@ class SungrowHttpConfig():
             logging.warning("Problem disabling feed-in limitation")
             return False
         return True
+
+    def _decodeModbusExportLimitPayload(self, modbusMsg):
+        """ Decodes the supplied modbus message into individual registers
+        :param modbusMsg: The hex string representing the modbus response
+        :returns Array of register values
+        """
+        response_data = bytes.fromhex(modbusMsg)
+        data_section = response_data[4:-4]
+        num_registers = len(data_section) // 2
+        registers = [int.from_bytes(data_section[i:i+2], byteorder='little', signed=False) for i in range(0, len(data_section), 2)]
+        return registers
+
+    def getCurrentExportLimit(self):
+        """ Obtains the current export limit setting
+        :returns: The current export limit in dekawatts, or 0 if no limit set
+        """
+        msg1 = self._sendHexMessageToDevice("010379F400081CA2") # Is feed-in limitation on?
+        msg1resp = msg1.get("data")
+        registers = self._decodeModbusExportLimitPayload(msg1resp)
+        if (registers[0]==341): # Feed-in limitation is disabled
+            return 0
+        elif (registers[0]==170):
+            return registers[1]
+        else:
+            raise Exception("Unknown response to query for current export limit: {resp}".format(resp=msg1resp))
+
+        return 0
