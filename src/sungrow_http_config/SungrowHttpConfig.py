@@ -136,9 +136,13 @@ class SungrowHttpConfig():
             "token": self.token
         }
         resp = self._callAPI("/device/passthroughway", req)
-        if not resp.get("result_code")==1:
+        if resp.get("result_code")==1:
+            return resp.get("result_data")
+        elif resp.get("result_code")==106: # Token expired
+            self.token=""
+            return self._sendHexMessageToDevice(msgValue, msgType)
+        else:
             raise Exception("Got unsuccessful message back from device: {resp}".format(resp=resp))
-        return resp.get("result_data")
 
     def _generateExportLimitCommand(self, dekawattLimit):
         """ Generates the appropriate modbus command to send for the given limit
