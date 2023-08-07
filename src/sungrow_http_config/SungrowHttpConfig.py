@@ -163,6 +163,15 @@ class SungrowHttpConfig():
         packet = c.encode(raw_packet, "hex_codec").decode("utf-8").upper()
         return packet
 
+    def getDeviceSerialNumber(self):
+        """ Retrieve the device serial number to uniquely identify it
+        :returns: String containting the serial number of the inverter
+        """
+        if self.productVersion == {}:
+            self.connect()
+
+        return self.productVersion["dev_sn"]
+
     def setExportLimit(self, dekawattLimit):
         """ Enable export limit and set to 0kW (zero export limit)
         :param dekawattLimit: Limit to set, in dekawatts (kW * 100). Note 0 == unlimited, so set 1 for 0.01kW
