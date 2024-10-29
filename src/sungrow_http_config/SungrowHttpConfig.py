@@ -1,5 +1,6 @@
 from urllib3.exceptions import TimeoutStateError
-import requests_retry_on_exceptions as requests
+from tenacity import retry, stop_after_attempt, wait_fixed
+import requests
 import json
 import urllib3
 import logging
@@ -26,7 +27,7 @@ class SungrowHttpConfig():
         self.token = ""
         self.dongleVersion = ""
         self.productVersion = {}
-
+        self.session = requests.Session()
 
     def connect(self):
         """ Connect to the dongle, verify it's supported, obtain and upgrade token
@@ -67,17 +68,25 @@ class SungrowHttpConfig():
         version.get("dev_type")==21 and \
         version.get("dev_procotol")==2
 
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_fixed(2)
+    )
     def _getDongleVersion(self):
         """ Connect to the API using GET and retrieve the dongle version info
         :returns: String of product_name/product_code
         """
         url = "{proto}://{host}/product/list".format(proto=self.proto,host=self.host)
-        resp = requests.get(url, verify=False, exceptions=(requests.exceptions.ConnectionError,),backoff_factor=0.1,retries=3)
+        resp = self.session.get(url, verify=False)
         rjson = resp.json().get('result_data')
         dongleString = "{name}/{code}".format(name=rjson.get('product_name'),code=rjson.get('product_code'))
         logging.debug("Detected dongle version as {ver}".format(ver=dongleString))
         return dongleString
 
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_fixed(2)
+    )
     def _callAPI(self, path, reqJson):
         """ Calls the API with POST (most methods) with the supplied JSON payload
         :param path: The API endpoint to use
@@ -87,7 +96,7 @@ class SungrowHttpConfig():
         url = "{proto}://{host}{path}".format(proto=self.proto,host=self.host,path=path)
         # Sungrow inverters use a self-signed certificate, so verification is impossible
         # The dongles can get overwhelmed with requests and occasionally refuse connections, so retry
-        resp = requests.post(url, json=reqJson, verify=False, exceptions=(requests.exceptions.ConnectionError,),backoff_factor=0.1,retries=3)
+        resp = self.session.post(url, json=reqJson, verify=False)
         return resp.json()
 
     def _obtainToken(self):
@@ -216,9 +225,9 @@ class SungrowHttpConfig():
         :returns Array of register values
         """
         response_data = bytes.fromhex(modbusMsg)
-        data_section = response_data[4:-4]
+        data_section = response_data[3:-2]
         num_registers = len(data_section) // 2
-        registers = [int.from_bytes(data_section[i:i+2], byteorder='little', signed=False) for i in range(0, len(data_section), 2)]
+        registers = [int.from_bytes(data_section[i:i+2], byteorder='big', signed=False) for i in range(0, len(data_section), 2)]
         return registers
 
     def getCurrentExportLimit(self):
@@ -228,11 +237,11 @@ class SungrowHttpConfig():
         msg1 = self._sendHexMessageToDevice("010379F400081CA2") # Is feed-in limitation on?
         msg1resp = msg1.get("data")
         registers = self._decodeModbusExportLimitPayload(msg1resp)
-        if (registers[0]==341): # Feed-in limitation is disabled
+        if (registers[0]==341 or registers[0]==85): # Feed-in limitation is disabled
             return 0
         elif (registers[0]==170):
             return registers[1]
         else:
-            raise Exception("Unknown response to query for current export limit: {resp}".format(resp=msg1resp))
+            raise Exception("Unknown response to query for current export limit: {resp}, decoded register value {reg}".format(resp=msg1resp,reg=registers[0]))
 
         return 0
