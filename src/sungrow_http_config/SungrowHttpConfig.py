@@ -234,9 +234,15 @@ class SungrowHttpConfig():
         """ Obtains the current export limit setting
         :returns: The current export limit in dekawatts, or 0 if no limit set
         """
-        msg1 = self._sendHexMessageToDevice("010379F400081CA2") # Is feed-in limitation on?
-        msg1resp = msg1.get("data")
-        registers = self._decodeModbusExportLimitPayload(msg1resp)
+        registers = []
+        while len(registers)==0:
+            msg1 = self._sendHexMessageToDevice("010379F400081CA2") # Is feed-in limitation on?
+            msg1resp = msg1.get("data")
+            registers = self._decodeModbusExportLimitPayload(msg1resp)
+            if len(registers)==0:
+                logging.warning("No registers received in modbus reply, calling connect")
+                self.connect()
+
         if (registers[0]==341 or registers[0]==85): # Feed-in limitation is disabled
             return 0
         elif (registers[0]==170):

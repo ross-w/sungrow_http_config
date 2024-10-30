@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sungrow_http_config"
-version = "0.0.7"
+version = "0.0.8"
 dependencies = ["tenacity", "urllib3", "pymodbus<2.6"]
 authors = [{ name = "Ross Williamson", email = "ross@inertia.net.nz" }]
 description = "A package to manipulate settings on Sungrow Inverters"
