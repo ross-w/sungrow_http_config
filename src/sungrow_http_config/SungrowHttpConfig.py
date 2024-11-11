@@ -276,7 +276,7 @@ class SungrowHttpConfig():
         """
         try:
             registers = []
-            while len(registers) == 0:
+            while (len(registers) == 0) and (0 not in dict(enumerate(registers))):
                 msg1 = self._sendHexMessageToDevice("010379F400081CA2")  # Is feed-in limitation on?
                 msg1resp = msg1.get("data")
                 registers = self._decodeModbusExportLimitPayload(msg1resp)
