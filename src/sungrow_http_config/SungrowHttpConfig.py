@@ -1,5 +1,5 @@
-from urllib3.exceptions import TimeoutStateError
-from tenacity import retry, stop_after_attempt, wait_fixed
+from urllib3.exceptions import TimeoutError
+from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 import requests
 import json
 import urllib3
@@ -9,6 +9,7 @@ from pymodbus.constants import Endian
 from pymodbus.payload import BinaryPayloadDecoder
 import pymodbus.register_write_message as modbus_register_write
 from pymodbus.transaction import ModbusRtuFramer
+from requests.exceptions import Timeout, ConnectionError, RequestException
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -16,18 +17,59 @@ class SungrowHttpConfig():
     """ Implementation of the Sungrow Local Access HTTP API
     """
 
-    def __init__(self, host):
-        """ Initialise the http client
-        :param host: The hostname or IP adddress of the WiNet-S dongle connected to the inverter
-        """
+    # Default timeout in seconds for HTTP requests
+    DEFAULT_TIMEOUT = 10
+    # Default number of retry attempts
+    MAX_RETRIES = 4
+    # Wait time between retries in seconds
+    RETRY_WAIT = 2
 
+    def __init__(self, host, timeout=DEFAULT_TIMEOUT):
+        """ Initialise the http client
+        :param host: The hostname or IP address of the WiNet-S dongle connected to the inverter
+        :param timeout: Timeout in seconds for HTTP requests
+        """
         self.host = host
         self.proto = "https"
         self.lang = "_en_US"
         self.token = ""
         self.dongleVersion = ""
         self.productVersion = {}
+        self.timeout = timeout
         self.session = requests.Session()
+
+    @retry(
+        stop=stop_after_attempt(MAX_RETRIES),
+        wait=wait_fixed(RETRY_WAIT),
+        retry=retry_if_exception_type((Timeout, ConnectionError, TimeoutError))
+    )
+    def _make_request(self, method, url, **kwargs):
+        """Make an HTTP request with timeout and retry handling
+
+        :param method: HTTP method ('GET' or 'POST')
+        :param url: URL to request
+        :param kwargs: Additional arguments to pass to requests
+        :returns: Response from the server
+        :raises: RequestException if all retries fail
+        """
+        try:
+            kwargs['timeout'] = self.timeout
+            kwargs['verify'] = False  # Due to self-signed cert
+
+            response = self.session.request(method, url, **kwargs)
+            response.raise_for_status()
+
+            return response
+
+        except Timeout:
+            logging.warning(f"Request timeout reached ({self.timeout}s) for URL: {url}")
+            raise
+        except ConnectionError as e:
+            logging.warning(f"Connection error for URL {url}: {str(e)}")
+            raise
+        except RequestException as e:
+            logging.error(f"Request failed for URL {url}: {str(e)}")
+            raise
 
     def connect(self):
         """ Connect to the dongle, verify it's supported, obtain and upgrade token
@@ -68,35 +110,25 @@ class SungrowHttpConfig():
         version.get("dev_type")==21 and \
         version.get("dev_procotol")==2
 
-    @retry(
-        stop=stop_after_attempt(4),
-        wait=wait_fixed(2)
-    )
     def _getDongleVersion(self):
         """ Connect to the API using GET and retrieve the dongle version info
         :returns: String of product_name/product_code
         """
-        url = "{proto}://{host}/product/list".format(proto=self.proto,host=self.host)
-        resp = self.session.get(url, verify=False)
+        url = f"{self.proto}://{self.host}/product/list"
+        resp = self._make_request('GET', url)
         rjson = resp.json().get('result_data')
-        dongleString = "{name}/{code}".format(name=rjson.get('product_name'),code=rjson.get('product_code'))
-        logging.debug("Detected dongle version as {ver}".format(ver=dongleString))
+        dongleString = f"{rjson.get('product_name')}/{rjson.get('product_code')}"
+        logging.debug(f"Detected dongle version as {dongleString}")
         return dongleString
 
-    @retry(
-        stop=stop_after_attempt(4),
-        wait=wait_fixed(2)
-    )
     def _callAPI(self, path, reqJson):
         """ Calls the API with POST (most methods) with the supplied JSON payload
         :param path: The API endpoint to use
         :param reqJson: A JSON object containing the payload to send
         :returns: Dict containing the response
         """
-        url = "{proto}://{host}{path}".format(proto=self.proto,host=self.host,path=path)
-        # Sungrow inverters use a self-signed certificate, so verification is impossible
-        # The dongles can get overwhelmed with requests and occasionally refuse connections, so retry
-        resp = self.session.post(url, json=reqJson, verify=False)
+        url = f"{self.proto}://{self.host}{path}"
+        resp = self._make_request('POST', url, json=reqJson)
         return resp.json()
 
     def _obtainToken(self):
@@ -186,25 +218,32 @@ class SungrowHttpConfig():
         :param dekawattLimit: Limit to set, in dekawatts (kW * 100). Note 0 == unlimited, so set 1 for 0.01kW
         :returns: True if successful
         """
+        try:
+            msg1 = self._sendHexMessageToDevice("010679F400AA511B")  # Turn on feed-in limitation
+            msg1resp = msg1.get("data")
+            if msg1resp == "010679F400AA511B":
+                logging.debug("Feed-in limitation enabled")
+            else:
+                logging.warning("Problem enabling feed-in limitation")
+                return False
 
-        msg1 = self._sendHexMessageToDevice("010679F400AA511B") # Turn on feed-in limitation
-        msg1resp = msg1.get("data")
-        if msg1resp == "010679F400AA511B":
-            logging.debug("Feed-in limitation enabled")
-        else:
-            logging.warning("Problem enabling feed-in limitation")
-            return False
+            exportLimitCommand = self._generateExportLimitCommand(dekawattLimit)
+            logging.debug(f"Generated modbus export limit command as {exportLimitCommand}")
+            msg2 = self._sendHexMessageToDevice(exportLimitCommand)  # Set limit
+            msg2resp = msg2.get("data")
+            if msg2resp == exportLimitCommand:
+                logging.debug(f"Feed-in limitation set at {dekawattLimit/100}kW")
+            else:
+                logging.warning(f"Problem setting feed-in limitation to {dekawattLimit/100}kW, modbus response was {msg2resp}")
+                return False
+            return True
 
-        exportLimitCommand = self._generateExportLimitCommand(dekawattLimit)
-        logging.debug("Generated modbus export limit command as {command}".format(command=exportLimitCommand))
-        msg2 = self._sendHexMessageToDevice(exportLimitCommand) # Set limit
-        msg2resp = msg2.get("data")
-        if msg2resp == exportLimitCommand:
-            logging.debug("Feed-in limitation set at {power}kW".format(power=dekawattLimit/100))
-        else:
-            logging.warning("Problem setting feed-in limitation to {power}kW, modbus response was {resp}".format(power=dekawattLimit/100,resp=msg2resp))
-            return False
-        return True
+        except (Timeout, ConnectionError) as e:
+            logging.error(f"Communication error while setting export limit: {str(e)}")
+            raise
+        except Exception as e:
+            logging.error(f"Unexpected error while setting export limit: {str(e)}")
+            raise
 
     def unsetExportLimit(self):
         """ Turns off any export limit in place (no limit)
@@ -233,21 +272,28 @@ class SungrowHttpConfig():
     def getCurrentExportLimit(self):
         """ Obtains the current export limit setting
         :returns: The current export limit in dekawatts, or 0 if no limit set
+        :raises: RequestException if communication fails after retries
         """
-        registers = []
-        while len(registers)==0:
-            msg1 = self._sendHexMessageToDevice("010379F400081CA2") # Is feed-in limitation on?
-            msg1resp = msg1.get("data")
-            registers = self._decodeModbusExportLimitPayload(msg1resp)
-            if len(registers)==0:
-                logging.warning("No registers received in modbus reply, calling connect")
-                self.connect()
+        try:
+            registers = []
+            while len(registers) == 0:
+                msg1 = self._sendHexMessageToDevice("010379F400081CA2")  # Is feed-in limitation on?
+                msg1resp = msg1.get("data")
+                registers = self._decodeModbusExportLimitPayload(msg1resp)
+                if len(registers) == 0:
+                    logging.warning("No registers received in modbus reply, calling connect")
+                    self.connect()
 
-        if (registers[0]==341 or registers[0]==85): # Feed-in limitation is disabled
-            return 0
-        elif (registers[0]==170):
-            return registers[1]
-        else:
-            raise Exception("Unknown response to query for current export limit: {resp}, decoded register value {reg}".format(resp=msg1resp,reg=registers[0]))
+            if (registers[0] == 341 or registers[0] == 85):  # Feed-in limitation is disabled
+                return 0
+            elif (registers[0] == 170):
+                return registers[1]
+            else:
+                raise Exception(f"Unknown response to query for current export limit: {msg1resp}, decoded register value {registers[0]}")
 
-        return 0
+        except (Timeout, ConnectionError) as e:
+            logging.error(f"Communication error while getting export limit: {str(e)}")
+            raise
+        except Exception as e:
+            logging.error(f"Unexpected error while getting export limit: {str(e)}")
+            raise
