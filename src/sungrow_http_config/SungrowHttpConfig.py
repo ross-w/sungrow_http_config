@@ -9,35 +9,132 @@ from pymodbus.constants import Endian
 from pymodbus.payload import BinaryPayloadDecoder
 import pymodbus.register_write_message as modbus_register_write
 from pymodbus.transaction import ModbusRtuFramer
+from SungrowModbusTcpClient import SungrowModbusTcpClient
 from requests.exceptions import Timeout, ConnectionError, RequestException
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 class SungrowHttpConfig():
-    """ Implementation of the Sungrow Local Access HTTP API
+    """ Implementation of the Sungrow Local Access API
+    Supports both HTTP and direct Modbus communication
     """
 
-    # Default timeout in seconds for HTTP requests
+    # Default timeout in seconds for requests
     DEFAULT_TIMEOUT = 10
     # Default number of retry attempts
     MAX_RETRIES = 4
     # Wait time between retries in seconds
     RETRY_WAIT = 2
+    # Default Modbus port
+    DEFAULT_MODBUS_PORT = 502
+    # Default Modbus unit ID
+    DEFAULT_MODBUS_UNIT_ID = 1
 
-    def __init__(self, host, timeout=DEFAULT_TIMEOUT):
-        """ Initialise the http client
-        :param host: The hostname or IP address of the WiNet-S dongle connected to the inverter
-        :param timeout: Timeout in seconds for HTTP requests
+    def __init__(self, host, timeout=DEFAULT_TIMEOUT, mode="http", port=DEFAULT_MODBUS_PORT, unit_id=DEFAULT_MODBUS_UNIT_ID):
+        """ Initialise the client
+        :param host: The hostname or IP address of the inverter or WiNet-S dongle
+        :param timeout: Timeout in seconds for requests
+        :param mode: Communication mode, either "http" or "modbus"
+        :param port: Modbus TCP port (only used in modbus mode)
+        :param unit_id: Modbus unit ID (only used in modbus mode)
         """
         self.host = host
-        self.proto = "https"
-        self.lang = "_en_US"
-        self.token = ""
-        self.dongleVersion = ""
-        self.productVersion = {}
         self.timeout = timeout
-        self.session = requests.Session()
+        self.mode = mode.lower()
+        self.port = port
+        self.unit_id = unit_id
+        
+        # Initialise mode-specific attributes
+        if self.mode == "http":
+            self.proto = "https"
+            self.lang = "_en_US"
+            self.token = ""
+            self.dongleVersion = ""
+            self.productVersion = {}
+            self.session = requests.Session()
+        elif self.mode == "modbus":
+            self.client = None
+        else:
+            raise ValueError(f"Unsupported mode: {self.mode}. Use 'http' or 'modbus'.")
 
+    def connect(self):
+        """ Connect to the inverter
+        :returns: True if successful
+        """
+        if self.mode == "http":
+            return self._http_connect()
+        else:  # modbus mode
+            return self._modbus_connect()
+
+    def getDeviceSerialNumber(self):
+        """ Retrieve the device serial number to uniquely identify it
+        :returns: String containing the serial number of the inverter
+        """
+        if self.mode == "http":
+            if self.productVersion == {}:
+                self.connect()
+            return self.productVersion["dev_sn"]
+        else:  # modbus mode
+            # Register 4990 contains the device serial number (use 4989 with read_input_registers)
+            if not self.client or not self.client.is_socket_open():
+                self.connect()
+                
+            # Use read_input_registers with address-1 and read 10 registers
+            result = self.client.read_input_registers(4989, 10, unit=self.unit_id)
+            if result.isError():
+                raise Exception(f"Failed to read device serial number: {result}")
+            
+            # Use the UTF-8 decoding approach from the other project
+            try:
+                # Take first register and then the next 4 registers (total 10 bytes)
+                utf_value = result.registers[0].to_bytes(2, 'big')
+                for x in range(1, 5):
+                    utf_value += result.registers[x].to_bytes(2, 'big')
+                
+                # Decode as UTF-8 and remove null bytes
+                return utf_value.decode('utf-8').rstrip('\x00')
+            except UnicodeDecodeError:
+                try:
+                    # Try ASCII as fallback
+                    return utf_value.decode('ascii').rstrip('\x00')
+                except UnicodeDecodeError:
+                    # If both decodings fail, return as hex string
+                    logging.warning("Could not decode serial number as UTF-8 or ASCII, returning hex representation")
+                    return utf_value.hex().upper()
+
+    def setExportLimit(self, dekawattLimit):
+        """ Enable export limit and set to specified value
+        :param dekawattLimit: Limit to set, in dekawatts (kW * 100). Note 0 == unlimited, so set 1 for 0.01kW
+        :returns: True if successful
+        """
+        try:
+            if self.mode == "http":
+                return self._http_set_export_limit(dekawattLimit)
+            else:  # modbus mode
+                return self._modbus_set_export_limit(dekawattLimit)
+        except Exception as e:
+            logging.error(f"Error setting export limit: {str(e)}")
+            raise
+
+    def unsetExportLimit(self):
+        """ Turns off any export limit in place (no limit)
+        :returns: True if successful
+        """
+        if self.mode == "http":
+            return self._http_unset_export_limit()
+        else:  # modbus mode
+            return self._modbus_unset_export_limit()
+
+    def getCurrentExportLimit(self):
+        """ Obtains the current export limit setting
+        :returns: The current export limit in dekawatts, or 0 if no limit set
+        """
+        if self.mode == "http":
+            return self._http_get_current_export_limit()
+        else:  # modbus mode
+            return self._modbus_get_current_export_limit()
+
+    # HTTP mode implementation
     @retry(
         stop=stop_after_attempt(MAX_RETRIES),
         wait=wait_fixed(RETRY_WAIT),
@@ -71,11 +168,10 @@ class SungrowHttpConfig():
             logging.error(f"Request failed for URL {url}: {str(e)}")
             raise
 
-    def connect(self):
+    def _http_connect(self):
         """ Connect to the dongle, verify it's supported, obtain and upgrade token
         :returns: True if successful
         """
-
         self.dongleVersion = self._getDongleVersion()
 
         if not self._isSupportedDongleVersion(self.dongleVersion):
@@ -154,7 +250,8 @@ class SungrowHttpConfig():
         :returns: True if successful
         """
         resp = self._callAPI("/upgrade/upgradeStatus", {"lang": self.lang, "token": self.token})
-        return resp.get("result_data").get("nextProcess")=="0"
+        np = resp.get("result_data").get("nextProcess")
+        return (np=="0" or np=="1")
 
     def _sendHexMessageToDevice(self, msgValue, msgType="0"):
         """ Sends the supplied hex string to the API and returns the result
@@ -162,7 +259,6 @@ class SungrowHttpConfig():
         :param msgType: The type of message to send, default is "0"
         :returns: Dict containing the response
         """
-
         if not self.token:
             self.connect()
 
@@ -204,60 +300,6 @@ class SungrowHttpConfig():
         packet = c.encode(raw_packet, "hex_codec").decode("utf-8").upper()
         return packet
 
-    def getDeviceSerialNumber(self):
-        """ Retrieve the device serial number to uniquely identify it
-        :returns: String containting the serial number of the inverter
-        """
-        if self.productVersion == {}:
-            self.connect()
-
-        return self.productVersion["dev_sn"]
-
-    def setExportLimit(self, dekawattLimit):
-        """ Enable export limit and set to 0kW (zero export limit)
-        :param dekawattLimit: Limit to set, in dekawatts (kW * 100). Note 0 == unlimited, so set 1 for 0.01kW
-        :returns: True if successful
-        """
-        try:
-            msg1 = self._sendHexMessageToDevice("010679F400AA511B")  # Turn on feed-in limitation
-            msg1resp = msg1.get("data")
-            if msg1resp == "010679F400AA511B":
-                logging.debug("Feed-in limitation enabled")
-            else:
-                logging.warning("Problem enabling feed-in limitation")
-                return False
-
-            exportLimitCommand = self._generateExportLimitCommand(dekawattLimit)
-            logging.debug(f"Generated modbus export limit command as {exportLimitCommand}")
-            msg2 = self._sendHexMessageToDevice(exportLimitCommand)  # Set limit
-            msg2resp = msg2.get("data")
-            if msg2resp == exportLimitCommand:
-                logging.debug(f"Feed-in limitation set at {dekawattLimit/100}kW")
-            else:
-                logging.warning(f"Problem setting feed-in limitation to {dekawattLimit/100}kW, modbus response was {msg2resp}")
-                return False
-            return True
-
-        except (Timeout, ConnectionError) as e:
-            logging.error(f"Communication error while setting export limit: {str(e)}")
-            raise
-        except Exception as e:
-            logging.error(f"Unexpected error while setting export limit: {str(e)}")
-            raise
-
-    def unsetExportLimit(self):
-        """ Turns off any export limit in place (no limit)
-        :returns: True if successful
-        """
-        msg1 = self._sendHexMessageToDevice("010679F40055115B") # Turn off feedin limitation
-        msg1resp = msg1.get("data")
-        if msg1resp == "010679F40055115B":
-            logging.debug("Feed-in limitation disabled")
-        else:
-            logging.warning("Problem disabling feed-in limitation")
-            return False
-        return True
-
     def _decodeModbusExportLimitPayload(self, modbusMsg):
         """ Decodes the supplied modbus message into individual registers
         :param modbusMsg: The hex string representing the modbus response
@@ -269,31 +311,145 @@ class SungrowHttpConfig():
         registers = [int.from_bytes(data_section[i:i+2], byteorder='big', signed=False) for i in range(0, len(data_section), 2)]
         return registers
 
-    def getCurrentExportLimit(self):
-        """ Obtains the current export limit setting
-        :returns: The current export limit in dekawatts, or 0 if no limit set
-        :raises: RequestException if communication fails after retries
+    def _http_set_export_limit(self, dekawattLimit):
+        """ Enable export limit and set to specified value using HTTP mode
+        :param dekawattLimit: Limit to set, in dekawatts (kW * 100)
+        :returns: True if successful
         """
+        msg1 = self._sendHexMessageToDevice("010679F400AA511B")  # Turn on feed-in limitation
+        msg1resp = msg1.get("data")
+        if msg1resp == "010679F400AA511B":
+            logging.debug("Feed-in limitation enabled")
+        else:
+            logging.warning("Problem enabling feed-in limitation")
+            return False
+
+        exportLimitCommand = self._generateExportLimitCommand(dekawattLimit)
+        logging.debug(f"Generated modbus export limit command as {exportLimitCommand}")
+        msg2 = self._sendHexMessageToDevice(exportLimitCommand)  # Set limit
+        msg2resp = msg2.get("data")
+        if msg2resp == exportLimitCommand:
+            logging.debug(f"Feed-in limitation set at {dekawattLimit/100}kW")
+        else:
+            logging.warning(f"Problem setting feed-in limitation to {dekawattLimit/100}kW, modbus response was {msg2resp}")
+            return False
+        return True
+
+    def _http_unset_export_limit(self):
+        """ Turns off any export limit in place (no limit) using HTTP mode
+        :returns: True if successful
+        """
+        msg1 = self._sendHexMessageToDevice("010679F40055115B") # Turn off feedin limitation
+        msg1resp = msg1.get("data")
+        if msg1resp == "010679F40055115B":
+            logging.debug("Feed-in limitation disabled")
+        else:
+            logging.warning("Problem disabling feed-in limitation")
+            return False
+        return True
+
+    def _http_get_current_export_limit(self):
+        """ Obtains the current export limit setting using HTTP mode
+        :returns: The current export limit in dekawatts, or 0 if no limit set
+        """
+        registers = []
+        while (len(registers) == 0) and (0 not in dict(enumerate(registers))):
+            msg1 = self._sendHexMessageToDevice("010379F400081CA2")  # Is feed-in limitation on?
+            msg1resp = msg1.get("data")
+            registers = self._decodeModbusExportLimitPayload(msg1resp)
+            if len(registers) == 0:
+                logging.warning("No registers received in modbus reply, calling connect")
+                self.connect()
+
+        if (registers[0] == 341 or registers[0] == 85):  # Feed-in limitation is disabled
+            return 0
+        elif (registers[0] == 170):
+            return registers[1]
+        else:
+            raise Exception(f"Unknown response to query for current export limit: {msg1resp}, decoded register value {registers[0]}")
+
+    # Modbus mode implementation
+    def _modbus_connect(self):
+        """ Connect to the inverter using direct Modbus TCP
+        :returns: True if successful
+        """
+        client_config = {
+            "host":     self.host,
+            "port":     self.port,
+            "timeout":  self.timeout,
+            "retries":  self.MAX_RETRIES,
+            "RetryOnEmpty": False,
+            "unit":     self.unit_id,
+        }
         try:
-            registers = []
-            while (len(registers) == 0) and (0 not in dict(enumerate(registers))):
-                msg1 = self._sendHexMessageToDevice("010379F400081CA2")  # Is feed-in limitation on?
-                msg1resp = msg1.get("data")
-                registers = self._decodeModbusExportLimitPayload(msg1resp)
-                if len(registers) == 0:
-                    logging.warning("No registers received in modbus reply, calling connect")
-                    self.connect()
+            if self.client is None:
+                self.client = SungrowModbusTcpClient.SungrowModbusTcpClient(**client_config)
+            
+            self.client.connect()
+            
+            # Wait 3 seconds after connecting to fix timing issues
+            import time
+            time.sleep(3)
 
-            if (registers[0] == 341 or registers[0] == 85):  # Feed-in limitation is disabled
-                return 0
-            elif (registers[0] == 170):
-                return registers[1]
-            else:
-                raise Exception(f"Unknown response to query for current export limit: {msg1resp}, decoded register value {registers[0]}")
-
-        except (Timeout, ConnectionError) as e:
-            logging.error(f"Communication error while getting export limit: {str(e)}")
-            raise
+            return True
         except Exception as e:
-            logging.error(f"Unexpected error while getting export limit: {str(e)}")
+            logging.error(f"Error connecting to Modbus server: {str(e)}")
             raise
+
+    def _modbus_set_export_limit(self, dekawattLimit):
+        """ Enable export limit and set to specified value using direct Modbus
+        :param dekawattLimit: Limit to set, in dekawatts (kW * 100)
+        :returns: True if successful
+        """
+        if not self.client or not self.client.is_socket_open():
+            self.connect()
+            
+        # Register 31220 (0x79F4) - Enable feed-in limitation (value 0xAA)
+        result = self.client.write_register(31220, 0xAA, unit=self.unit_id)
+        if result.isError():
+            logging.warning("Problem enabling feed-in limitation")
+            return False
+        
+        # Register 31221 (0x79F5) - Set export limit value
+        result = self.client.write_register(31221, dekawattLimit, unit=self.unit_id)
+        if result.isError():
+            logging.warning(f"Problem setting feed-in limitation to {dekawattLimit/100}kW")
+            return False
+            
+        logging.debug(f"Feed-in limitation set at {dekawattLimit/100}kW")
+        return True
+
+    def _modbus_unset_export_limit(self):
+        """ Turns off any export limit in place (no limit) using direct Modbus
+        :returns: True if successful
+        """
+        if not self.client or not self.client.is_socket_open():
+            self.connect()
+            
+        # Register 31220 (0x79F4) - Disable feed-in limitation (value 0x55)
+        result = self.client.write_register(31220, 0x55, unit=self.unit_id)
+        if result.isError():
+            logging.warning("Problem disabling feed-in limitation")
+            return False
+            
+        logging.debug("Feed-in limitation disabled")
+        return True
+
+    def _modbus_get_current_export_limit(self):
+        """ Obtains the current export limit setting using direct Modbus
+        :returns: The current export limit in dekawatts, or 0 if no limit set
+        """
+        if not self.client or not self.client.is_socket_open():
+            self.connect()
+            
+        # Register 31220 (0x79F4) - Check if feed-in limitation is enabled
+        result = self.client.read_holding_registers(31220, 8, unit=self.unit_id)
+        if result.isError():
+            raise Exception(f"Failed to read export limit status: {result}")
+            
+        if result.registers[0] == 0x55 or result.registers[0] == 341:  # Feed-in limitation is disabled
+            return 0
+        elif result.registers[0] == 0xAA:  # Feed-in limitation is enabled
+            return result.registers[1]  # The second register contains the limit value
+        else:
+            raise Exception(f"Unknown response to query for current export limit: register value {result.registers[0]}")
