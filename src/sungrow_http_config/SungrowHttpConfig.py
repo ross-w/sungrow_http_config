@@ -9,6 +9,7 @@ from pymodbus.constants import Endian
 from pymodbus.payload import BinaryPayloadDecoder
 import pymodbus.register_write_message as modbus_register_write
 from pymodbus.transaction import ModbusRtuFramer
+from pymodbus.exceptions import ConnectionException, ModbusIOException
 from SungrowModbusTcpClient import SungrowModbusTcpClient
 from requests.exceptions import Timeout, ConnectionError, RequestException
 
@@ -76,13 +77,11 @@ class SungrowHttpConfig():
             return self.productVersion["dev_sn"]
         else:  # modbus mode
             # Register 4990 contains the device serial number (use 4989 with read_input_registers)
-            if not self.client or not self.client.is_socket_open():
-                self.connect()
-                
             # Use read_input_registers with address-1 and read 10 registers
-            result = self.client.read_input_registers(4989, 10, unit=self.unit_id)
-            if result.isError():
-                raise Exception(f"Failed to read device serial number: {result}")
+            result = self._execute_modbus_operation(
+                'read_input_registers',
+                4989, 10, unit=self.unit_id
+            )
             
             # Use the UTF-8 decoding approach from the other project
             try:
@@ -369,6 +368,85 @@ class SungrowHttpConfig():
             raise Exception(f"Unknown response to query for current export limit: {msg1resp}, decoded register value {registers[0]}")
 
     # Modbus mode implementation
+    @retry(
+        stop=stop_after_attempt(MAX_RETRIES),
+        wait=wait_fixed(RETRY_WAIT),
+        retry=retry_if_exception_type((ConnectionException, ModbusIOException, ConnectionError, OSError, AttributeError))
+    )
+    def _execute_modbus_operation(self, operation_name, *args, **kwargs):
+        """Execute a Modbus operation with retry handling
+        
+        :param operation_name: The name of the Modbus client method to call (e.g., 'read_holding_registers')
+        :param args: Arguments to pass to the operation function
+        :param kwargs: Keyword arguments to pass to the operation function
+        :returns: Result from the Modbus operation
+        :raises: Exception if all retries fail
+        """
+        try:
+            # Ensure we have a connection
+            if not self.client or not self.client.is_socket_open():
+                logging.debug("Modbus connection not open, reconnecting...")
+                self._modbus_connect()
+                
+            if not self.client:
+                raise ConnectionException("Failed to establish Modbus connection")
+                
+            # Get the operation function from the client
+            if not hasattr(self.client, operation_name):
+                raise AttributeError(f"Modbus client has no method named '{operation_name}'")
+                
+            operation_func = getattr(self.client, operation_name)
+                
+            # Execute the operation
+            result = operation_func(*args, **kwargs)
+            
+            # Check if the result indicates an error
+            if hasattr(result, 'isError') and result.isError():
+                error_msg = f"Modbus operation failed: {result}"
+                logging.warning(error_msg)
+                # Reconnect and retry
+                self._modbus_connect()
+                if not self.client:
+                    raise ConnectionException("Failed to re-establish Modbus connection")
+                operation_func = getattr(self.client, operation_name)
+                result = operation_func(*args, **kwargs)
+                if result.isError():
+                    raise Exception(error_msg)
+                    
+            return result
+            
+        except ConnectionException as e:
+            logging.warning(f"Modbus connection exception: {str(e)}")
+            # Force reconnection on next attempt
+            if self.client:
+                self.client.close()
+                self.client = None
+            raise
+        except ModbusIOException as e:
+            logging.warning(f"Modbus I/O exception: {str(e)}")
+            # Force reconnection on next attempt
+            if self.client:
+                self.client.close()
+                self.client = None
+            raise
+        except OSError as e:
+            logging.warning(f"OS error during Modbus operation: {str(e)}")
+            # Force reconnection on next attempt
+            if self.client:
+                self.client.close()
+                self.client = None
+            raise
+        except AttributeError as e:
+            logging.error(f"Attribute error during Modbus operation: {str(e)}")
+            # Force reconnection on next attempt
+            if self.client:
+                self.client.close()
+                self.client = None
+            raise
+        except Exception as e:
+            logging.error(f"Unexpected error during Modbus operation: {str(e)}")
+            raise
+            
     def _modbus_connect(self):
         """ Connect to the inverter using direct Modbus TCP
         :returns: True if successful
@@ -401,55 +479,59 @@ class SungrowHttpConfig():
         :param dekawattLimit: Limit to set, in dekawatts (kW * 100)
         :returns: True if successful
         """
-        if not self.client or not self.client.is_socket_open():
-            self.connect()
+        try:
+            # Register 31220 (0x79F4) - Enable feed-in limitation (value 0xAA)
+            result = self._execute_modbus_operation(
+                'write_register',
+                31220, 0xAA, unit=self.unit_id
+            )
             
-        # Register 31220 (0x79F4) - Enable feed-in limitation (value 0xAA)
-        result = self.client.write_register(31220, 0xAA, unit=self.unit_id)
-        if result.isError():
-            logging.warning("Problem enabling feed-in limitation")
+            # Register 31221 (0x79F5) - Set export limit value
+            result = self._execute_modbus_operation(
+                'write_register',
+                31221, dekawattLimit, unit=self.unit_id
+            )
+                
+            logging.debug(f"Feed-in limitation set at {dekawattLimit/100}kW")
+            return True
+        except Exception as e:
+            logging.warning(f"Problem setting feed-in limitation: {str(e)}")
             return False
-        
-        # Register 31221 (0x79F5) - Set export limit value
-        result = self.client.write_register(31221, dekawattLimit, unit=self.unit_id)
-        if result.isError():
-            logging.warning(f"Problem setting feed-in limitation to {dekawattLimit/100}kW")
-            return False
-            
-        logging.debug(f"Feed-in limitation set at {dekawattLimit/100}kW")
-        return True
 
     def _modbus_unset_export_limit(self):
         """ Turns off any export limit in place (no limit) using direct Modbus
         :returns: True if successful
         """
-        if not self.client or not self.client.is_socket_open():
-            self.connect()
-            
-        # Register 31220 (0x79F4) - Disable feed-in limitation (value 0x55)
-        result = self.client.write_register(31220, 0x55, unit=self.unit_id)
-        if result.isError():
-            logging.warning("Problem disabling feed-in limitation")
+        try:
+            # Register 31220 (0x79F4) - Disable feed-in limitation (value 0x55)
+            result = self._execute_modbus_operation(
+                'write_register',
+                31220, 0x55, unit=self.unit_id
+            )
+                
+            logging.debug("Feed-in limitation disabled")
+            return True
+        except Exception as e:
+            logging.warning(f"Problem disabling feed-in limitation: {str(e)}")
             return False
-            
-        logging.debug("Feed-in limitation disabled")
-        return True
 
     def _modbus_get_current_export_limit(self):
         """ Obtains the current export limit setting using direct Modbus
         :returns: The current export limit in dekawatts, or 0 if no limit set
         """
-        if not self.client or not self.client.is_socket_open():
-            self.connect()
-            
-        # Register 31220 (0x79F4) - Check if feed-in limitation is enabled
-        result = self.client.read_holding_registers(31220, 8, unit=self.unit_id)
-        if result.isError():
-            raise Exception(f"Failed to read export limit status: {result}")
-            
-        if result.registers[0] == 0x55 or result.registers[0] == 341:  # Feed-in limitation is disabled
-            return 0
-        elif result.registers[0] == 0xAA:  # Feed-in limitation is enabled
-            return result.registers[1]  # The second register contains the limit value
-        else:
-            raise Exception(f"Unknown response to query for current export limit: register value {result.registers[0]}")
+        try:
+            # Register 31220 (0x79F4) - Check if feed-in limitation is enabled
+            result = self._execute_modbus_operation(
+                'read_holding_registers',
+                31220, 8, unit=self.unit_id
+            )
+                
+            if result.registers[0] == 0x55 or result.registers[0] == 341:  # Feed-in limitation is disabled
+                return 0
+            elif result.registers[0] == 0xAA:  # Feed-in limitation is enabled
+                return result.registers[1]  # The second register contains the limit value
+            else:
+                raise Exception(f"Unknown response to query for current export limit: register value {result.registers[0]}")
+        except Exception as e:
+            logging.error(f"Failed to read export limit status: {str(e)}")
+            raise
