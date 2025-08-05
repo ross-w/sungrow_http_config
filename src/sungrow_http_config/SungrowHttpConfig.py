@@ -1,17 +1,15 @@
-from urllib3.exceptions import TimeoutError
-from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
-import requests
-import json
-import urllib3
-import logging
 import codecs as c
-from pymodbus.constants import Endian
-from pymodbus.payload import BinaryPayloadDecoder
+import logging
+
 import pymodbus.register_write_message as modbus_register_write
-from pymodbus.transaction import ModbusRtuFramer
+import requests
+import urllib3
 from pymodbus.exceptions import ConnectionException, ModbusIOException
+from pymodbus.transaction import ModbusRtuFramer
+from requests.exceptions import ConnectionError, RequestException, Timeout
 from SungrowModbusTcpClient import SungrowModbusTcpClient
-from requests.exceptions import Timeout, ConnectionError, RequestException
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
+from urllib3.exceptions import TimeoutError
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -306,7 +304,6 @@ class SungrowHttpConfig():
         """
         response_data = bytes.fromhex(modbusMsg)
         data_section = response_data[3:-2]
-        num_registers = len(data_section) // 2
         registers = [int.from_bytes(data_section[i:i+2], byteorder='big', signed=False) for i in range(0, len(data_section), 2)]
         return registers
 
@@ -481,13 +478,13 @@ class SungrowHttpConfig():
         """
         try:
             # Register 31220 (0x79F4) - Enable feed-in limitation (value 0xAA)
-            result = self._execute_modbus_operation(
+            self._execute_modbus_operation(
                 'write_register',
                 31220, 0xAA, unit=self.unit_id
             )
             
             # Register 31221 (0x79F5) - Set export limit value
-            result = self._execute_modbus_operation(
+            self._execute_modbus_operation(
                 'write_register',
                 31221, dekawattLimit, unit=self.unit_id
             )
@@ -504,7 +501,7 @@ class SungrowHttpConfig():
         """
         try:
             # Register 31220 (0x79F4) - Disable feed-in limitation (value 0x55)
-            result = self._execute_modbus_operation(
+            self._execute_modbus_operation(
                 'write_register',
                 31220, 0x55, unit=self.unit_id
             )
