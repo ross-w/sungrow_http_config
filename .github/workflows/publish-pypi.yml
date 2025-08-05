@@ -1,0 +1,203 @@
+name: "Publish to PyPI"
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  # Security validation (defense in depth - primary security is OIDC)
+  security-check:
+    name: "Security Validation"
+    runs-on: ubuntu-latest
+    outputs:
+      is-authorized: ${{ steps.check.outputs.authorized }}
+    steps:
+      - name: "Validate repository and context"
+        id: check
+        run: |
+          echo "🔒 Security validation:"
+          echo "Repository: ${{ github.repository }}"
+          echo "Actor: ${{ github.actor }}"
+          echo "Event: ${{ github.event_name }}"
+          echo "Ref: ${{ github.ref }}"
+          echo ""
+
+          # Check repository (defense in depth - OIDC is primary security)
+          if [[ "${{ github.repository }}" == "ross-w/sungrow_http_config" ]]; then
+            echo "✅ Repository validation passed"
+            echo "authorized=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Repository validation failed"
+            echo "Expected: ross-w/sungrow_http_config"
+            echo "Actual: ${{ github.repository }}"
+            echo "authorized=false" >> $GITHUB_OUTPUT
+            echo ""
+            echo "ℹ️  Note: Even if this check was bypassed, PyPI trusted publishing"
+            echo "   would reject the upload due to OIDC repository mismatch."
+          fi
+
+  lint:
+    name: "Lint Check"
+    needs: security-check
+    if: needs.security-check.outputs.is-authorized == 'true'
+    uses: ./.github/workflows/lint.yml
+
+  smoke-test:
+    name: "Smoke Test"
+    needs: security-check
+    if: needs.security-check.outputs.is-authorized == 'true'
+    uses: ./.github/workflows/smoke-test.yml
+
+  # Additional publish-specific validation
+  version-check:
+    name: "Version Validation"
+    needs: security-check
+    if: needs.security-check.outputs.is-authorized == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout repository"
+        uses: "actions/checkout@v4"
+        with:
+          # Fetch full history for setuptools-scm version detection
+          fetch-depth: 0
+
+      - name: "Set up Python"
+        uses: "actions/setup-python@v5"
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: "Install package"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: "Verify dynamic versioning for release"
+        run: |
+          python -c "
+          import sungrow_http_config
+          from importlib.metadata import version
+          pkg_version = version('sungrow_http_config')
+          print(f'📦 Detected version: {pkg_version}')
+
+          # For releases, ensure we have a proper version
+          if '${{ github.event_name }}' == 'release':
+              if 'dev' in pkg_version or '+' in pkg_version:
+                  print('❌ Development version detected for release')
+                  print('   This suggests the release tag may not be properly formatted')
+                  exit(1)
+              else:
+                  print('✅ Release version detected')
+          else:
+              print('ℹ️  Manual trigger - version validation skipped')
+          "
+
+  # Build package
+  build:
+    name: "Build Package"
+    needs: [security-check, lint, smoke-test, version-check]
+    if: needs.security-check.outputs.is-authorized == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "Checkout repository"
+        uses: "actions/checkout@v4"
+        with:
+          fetch-depth: 0
+
+      - name: "Set up Python"
+        uses: "actions/setup-python@v5"
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: "Install build tools"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "packaging>=24.2"
+          python -m pip install build twine
+
+      - name: "Build distribution packages"
+        run: python -m build
+
+      - name: "Validate package"
+        run: |
+          echo "📦 Built packages:"
+          ls -la dist/
+          echo ""
+          echo "🔍 Package validation:"
+          python -m twine check dist/*
+          echo ""
+          echo "📋 Package metadata:"
+          python -m pip install pkginfo
+          python -c "
+          import pkginfo
+          import glob
+
+          for wheel in glob.glob('dist/*.whl'):
+              info = pkginfo.get_metadata(wheel)
+              print(f'Name: {info.name}')
+              print(f'Version: {info.version}')
+              print(f'Author: {info.author}')
+              break
+          "
+
+      - name: "Upload build artifacts"
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-packages
+          path: dist/
+          retention-days: 7
+
+  # Publish using PyPI Trusted Publishing (OIDC)
+  publish:
+    name: "Publish to PyPI"
+    needs: [security-check, lint, smoke-test, version-check, build]
+    if: needs.security-check.outputs.is-authorized == 'true'
+    runs-on: ubuntu-latest
+
+    # CRITICAL SECURITY: This environment provides additional protection
+    # beyond OIDC trusted publishing. Forks cannot access this environment.
+    environment:
+      name: pypi
+      url: https://pypi.org/p/sungrow-http-config
+
+    # CRITICAL SECURITY: These permissions enable OIDC trusted publishing
+    # The id-token is cryptographically tied to this specific repository
+    permissions:
+      id-token: write # Required for PyPI trusted publishing
+      contents: read # Required to download artifacts
+
+    steps:
+      - name: "Download build artifacts"
+        uses: actions/download-artifact@v4
+        with:
+          name: dist-packages
+          path: dist/
+
+      - name: "Final security and package validation"
+        run: |
+          echo "🔒 Final security context:"
+          echo "Repository: ${{ github.repository }}"
+          echo "Environment: pypi"
+          echo "OIDC Token: Will be generated for this specific repository"
+          echo ""
+          echo "📦 Final package validation:"
+          ls -la dist/
+          python -m pip install "packaging>=24.2"
+          python -m pip install twine
+          python -m twine check dist/*
+
+      - name: "Publish to PyPI"
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true
+
+      - name: "Publication summary"
+        run: |
+          echo "✅ Package successfully published to PyPI"
+          echo "🔗 View at: https://pypi.org/project/sungrow-http-config/"
+          echo "📦 Published from release: ${{ github.ref_name }}"
+          echo "🔒 Security: Verified via PyPI trusted publishing (OIDC)"
