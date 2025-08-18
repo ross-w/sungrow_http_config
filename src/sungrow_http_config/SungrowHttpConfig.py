@@ -1,13 +1,44 @@
 import codecs as c
 import logging
 
-import pymodbus.register_write_message as modbus_register_write
 import requests
 import urllib3
 from pymodbus.exceptions import ConnectionException, ModbusIOException
-from pymodbus.transaction import ModbusRtuFramer
+from pymodbus.framer import FramerRTU
+from pymodbus.pdu import DecodePDU
+from pymodbus.pdu.register_message import WriteSingleRegisterRequest
 from requests.exceptions import ConnectionError, RequestException, Timeout
-from SungrowModbusTcpClient import SungrowModbusTcpClient
+
+# Compatibility layer for SungrowModbusTcpClient
+try:
+    # Test which version we have by checking the method signature
+    import inspect
+
+    from SungrowModbusTcpClient import SungrowModbusTcpClient
+    _test_client = SungrowModbusTcpClient.SungrowModbusTcpClient(host='test', port=502, timeout=1)
+    _read_sig = inspect.signature(_test_client.read_holding_registers)
+    
+    # Check which parameter name this version uses for the unit/device ID
+    if 'slave' in _read_sig.parameters:
+        # This is the jesseklm version with pymodbus 3.x support
+        _MODBUS_UNIT_PARAM = 'slave'
+    elif 'unit' in _read_sig.parameters:
+        # This is the original version with pymodbus 2.x
+        _MODBUS_UNIT_PARAM = 'unit'
+    elif 'device_id' in _read_sig.parameters:
+        # This is a newer version that uses device_id parameter
+        _MODBUS_UNIT_PARAM = 'device_id'
+    else:
+        # Unknown version, default to device_id for newer versions
+        _MODBUS_UNIT_PARAM = 'device_id'
+        
+except ImportError as e:
+    raise ImportError(
+        "Could not import SungrowModbusTcpClient. "
+        "Please install either 'SungrowModbusTcpClient-jesseklm>=0.1.9' (recommended) "
+        "or 'SungrowModbusTcpClient>=0.1.5' (legacy). "
+        f"Original error: {e}"
+    )
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 from urllib3.exceptions import TimeoutError
 
@@ -76,9 +107,11 @@ class SungrowHttpConfig():
         else:  # modbus mode
             # Register 4990 contains the device serial number (use 4989 with read_input_registers)
             # Use read_input_registers with address-1 and read 10 registers
+            # Use the detected parameter name for compatibility
+            kwargs = {_MODBUS_UNIT_PARAM: self.unit_id, 'count': 10}
             result = self._execute_modbus_operation(
                 'read_input_registers',
-                4989, 10, unit=self.unit_id
+                4989, **kwargs
             )
             
             # Use the UTF-8 decoding approach from the other project
@@ -283,17 +316,16 @@ class SungrowHttpConfig():
         :param dekawattLimit: Limit to set, in dekawatts (kW * 100)
         :returns: String containing modbus command string
         """
-        framer = ModbusRtuFramer(None)
-        arguments = {
-            "address": 31221,
-            "value": dekawattLimit,
-            "write_address": 31221,
-            "transaction": 1,
-            "slave": 1,
-            "protocol": 0x00,
-        }
-        message = modbus_register_write.WriteSingleRegisterRequest(**arguments)
-        raw_packet = framer.buildPacket(message)
+        # Create the Write Single Register request for pymodbus 3.x
+        message = WriteSingleRegisterRequest(address=31221, registers=[dekawattLimit])
+        
+        # Create RTU framer with DecodePDU for pymodbus 3.x
+        framer = FramerRTU(DecodePDU(is_server=False))
+        
+        # Encode the message with device ID 1
+        raw_packet = framer.encode(message.encode(), 1, 0)
+        
+        # Convert to hex string
         packet = c.encode(raw_packet, "hex_codec").decode("utf-8").upper()
         return packet
 
@@ -453,8 +485,6 @@ class SungrowHttpConfig():
             "port":     self.port,
             "timeout":  self.timeout,
             "retries":  self.MAX_RETRIES,
-            "RetryOnEmpty": False,
-            "unit":     self.unit_id,
         }
         try:
             if self.client is None:
@@ -478,15 +508,17 @@ class SungrowHttpConfig():
         """
         try:
             # Register 31220 (0x79F4) - Enable feed-in limitation (value 0xAA)
+            # Use the detected parameter name for compatibility
+            kwargs = {_MODBUS_UNIT_PARAM: self.unit_id}
             self._execute_modbus_operation(
                 'write_register',
-                31220, 0xAA, unit=self.unit_id
+                31220, 0xAA, **kwargs
             )
             
             # Register 31221 (0x79F5) - Set export limit value
             self._execute_modbus_operation(
                 'write_register',
-                31221, dekawattLimit, unit=self.unit_id
+                31221, dekawattLimit, **kwargs
             )
                 
             logging.debug(f"Feed-in limitation set at {dekawattLimit/100}kW")
@@ -501,9 +533,11 @@ class SungrowHttpConfig():
         """
         try:
             # Register 31220 (0x79F4) - Disable feed-in limitation (value 0x55)
+            # Use the detected parameter name for compatibility
+            kwargs = {_MODBUS_UNIT_PARAM: self.unit_id}
             self._execute_modbus_operation(
                 'write_register',
-                31220, 0x55, unit=self.unit_id
+                31220, 0x55, **kwargs
             )
                 
             logging.debug("Feed-in limitation disabled")
@@ -518,9 +552,11 @@ class SungrowHttpConfig():
         """
         try:
             # Register 31220 (0x79F4) - Check if feed-in limitation is enabled
+            # Use the detected parameter name for compatibility
+            kwargs = {_MODBUS_UNIT_PARAM: self.unit_id, 'count': 8}
             result = self._execute_modbus_operation(
                 'read_holding_registers',
-                31220, 8, unit=self.unit_id
+                31220, **kwargs
             )
                 
             if result.registers[0] == 0x55 or result.registers[0] == 341:  # Feed-in limitation is disabled
