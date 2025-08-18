@@ -6,11 +6,17 @@ build-backend = "setuptools.build_meta"
 name = "sungrow_http_config"
 dynamic = ["version"]
 license = "MIT"
-dependencies = ["tenacity", "urllib3", "pymodbus<2.6", "SungrowModbusTcpClient>=0.1.5"]
+dependencies = [
+    "tenacity", 
+    "urllib3", 
+    "pymodbus>=3.0,<4.0",
+    "requests",
+    "SungrowModbusTcpClient-jesseklm>=0.1.9"
+]
 authors = [{ name = "Ross Williamson", email = "ross@inertia.net.nz" }]
 description = "A package to manipulate settings on Sungrow Inverters"
 readme = "README.md"
-requires-python = ">=3.7"
+requires-python = ">=3.9"
 classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
