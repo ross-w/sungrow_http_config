@@ -17,7 +17,7 @@ try:
     from SungrowModbusTcpClient import SungrowModbusTcpClient
     _test_client = SungrowModbusTcpClient.SungrowModbusTcpClient(host='test', port=502, timeout=1)
     _read_sig = inspect.signature(_test_client.read_holding_registers)
-    
+
     # Check which parameter name this version uses for the unit/device ID
     if 'slave' in _read_sig.parameters:
         # This is the jesseklm version with pymodbus 3.x support
@@ -31,7 +31,7 @@ try:
     else:
         # Unknown version, default to device_id for newer versions
         _MODBUS_UNIT_PARAM = 'device_id'
-        
+
 except ImportError as e:
     raise ImportError(
         "Could not import SungrowModbusTcpClient. "
@@ -73,7 +73,8 @@ class SungrowHttpConfig():
         self.mode = mode.lower()
         self.port = port
         self.unit_id = unit_id
-        
+        self.logger = logging.getLogger(__name__)
+
         # Initialise mode-specific attributes
         if self.mode == "http":
             self.proto = "https"
@@ -113,14 +114,14 @@ class SungrowHttpConfig():
                 'read_input_registers',
                 4989, **kwargs
             )
-            
+
             # Use the UTF-8 decoding approach from the other project
             try:
                 # Take first register and then the next 4 registers (total 10 bytes)
                 utf_value = result.registers[0].to_bytes(2, 'big')
                 for x in range(1, 5):
                     utf_value += result.registers[x].to_bytes(2, 'big')
-                
+
                 # Decode as UTF-8 and remove null bytes
                 return utf_value.decode('utf-8').rstrip('\x00')
             except UnicodeDecodeError:
@@ -129,7 +130,7 @@ class SungrowHttpConfig():
                     return utf_value.decode('ascii').rstrip('\x00')
                 except UnicodeDecodeError:
                     # If both decodings fail, return as hex string
-                    logging.warning("Could not decode serial number as UTF-8 or ASCII, returning hex representation")
+                    self.logger.warning("Could not decode serial number as UTF-8 or ASCII, returning hex representation")
                     return utf_value.hex().upper()
 
     def setExportLimit(self, dekawattLimit):
@@ -143,7 +144,7 @@ class SungrowHttpConfig():
             else:  # modbus mode
                 return self._modbus_set_export_limit(dekawattLimit)
         except Exception as e:
-            logging.error(f"Error setting export limit: {str(e)}")
+            self.logger.error(f"Error setting export limit: {str(e)}")
             raise
 
     def unsetExportLimit(self):
@@ -189,13 +190,13 @@ class SungrowHttpConfig():
             return response
 
         except Timeout:
-            logging.warning(f"Request timeout reached ({self.timeout}s) for URL: {url}")
+            self.logger.warning(f"Request timeout reached ({self.timeout}s) for URL: {url}")
             raise
         except ConnectionError as e:
-            logging.warning(f"Connection error for URL {url}: {str(e)}")
+            self.logger.warning(f"Connection error for URL {url}: {str(e)}")
             raise
         except RequestException as e:
-            logging.error(f"Request failed for URL {url}: {str(e)}")
+            self.logger.error(f"Request failed for URL {url}: {str(e)}")
             raise
 
     def _http_connect(self):
@@ -244,7 +245,7 @@ class SungrowHttpConfig():
         resp = self._make_request('GET', url)
         rjson = resp.json().get('result_data')
         dongleString = f"{rjson.get('product_name')}/{rjson.get('product_code')}"
-        logging.debug(f"Detected dongle version as {dongleString}")
+        self.logger.debug(f"Detected dongle version as {dongleString}")
         return dongleString
 
     def _callAPI(self, path, reqJson):
@@ -263,7 +264,9 @@ class SungrowHttpConfig():
         """
         resp = self._callAPI("/user/connect", {"lang": self.lang, "service": "connect","token": ""})
         token = resp.get("result_data").get("token")
-        logging.debug("Obtained token {token}".format(token=token))
+        # Only log token at DEBUG level if explicitly enabled (avoid logging sensitive auth data)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("Obtained token (length: %d)", len(token) if token else 0)
         return token
 
     def _getProductVersion(self):
@@ -272,7 +275,7 @@ class SungrowHttpConfig():
         """
         resp = self._callAPI("/device/list", {"is_check_token": "0", "lang": self.lang, "service": "devicelist","token": self.token, "type": "0"})
         productVersion = resp.get("result_data").get("list")[0]
-        logging.debug("Product ID={id} Code={code} Type={type} Proto={proto} Model={model}".format(id=productVersion.get("dev_id"),code=productVersion.get("dev_code"),type=productVersion.get("dev_type"),proto=productVersion.get("dev_procotol"),model=productVersion.get("dev_model")))
+        self.logger.debug("Product ID={id} Code={code} Type={type} Proto={proto} Model={model}".format(id=productVersion.get("dev_id"),code=productVersion.get("dev_code"),type=productVersion.get("dev_type"),proto=productVersion.get("dev_procotol"),model=productVersion.get("dev_model")))
         return productVersion
 
     def _upgradeToken(self):
@@ -303,9 +306,17 @@ class SungrowHttpConfig():
             "token": self.token
         }
         resp = self._callAPI("/device/passthroughway", req)
+        # Only log full API responses at DEBUG level if explicitly enabled (avoid logging sensitive data)
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(f"API response for hex message {msgValue}: result_code={resp.get('result_code')}")
         if resp.get("result_code")==1:
-            return resp.get("result_data")
+            result_data = resp.get("result_data")
+            # Only log device data at DEBUG level if explicitly enabled (avoid logging sensitive device responses)
+            if self.logger.isEnabledFor(logging.DEBUG):
+                self.logger.debug(f"Result data from device: data_length={len(str(result_data)) if result_data else 0}")
+            return result_data
         elif resp.get("result_code")==106: # Token expired
+            self.logger.debug("Token expired, reconnecting and retrying")
             self.token=""
             return self._sendHexMessageToDevice(msgValue, msgType)
         else:
@@ -318,16 +329,29 @@ class SungrowHttpConfig():
         """
         # Create the Write Single Register request for pymodbus 3.x
         message = WriteSingleRegisterRequest(address=31221, registers=[dekawattLimit])
-        
+
         # Create RTU framer with DecodePDU for pymodbus 3.x
         framer = FramerRTU(DecodePDU(is_server=False))
-        
+
         # Encode the message with device ID 1
         raw_packet = framer.encode(message.encode(), 1, 0)
-        
+
         # Convert to hex string
         packet = c.encode(raw_packet, "hex_codec").decode("utf-8").upper()
         return packet
+
+    def _get_device_data_response(self, response, operation_description):
+        """Helper function to extract and validate data response from device
+
+        :param response: Response from _sendHexMessageToDevice
+        :param operation_description: Description of the operation for logging
+        :returns: Tuple of (success: bool, data_response: any)
+        """
+        data_response = response.get("data")
+        if data_response is None:
+            self.logger.warning(f"No data response received when {operation_description}, full response: {response!r}")
+            return False, None
+        return True, data_response
 
     def _decodeModbusExportLimitPayload(self, modbusMsg):
         """ Decodes the supplied modbus message into individual registers
@@ -345,21 +369,25 @@ class SungrowHttpConfig():
         :returns: True if successful
         """
         msg1 = self._sendHexMessageToDevice("010679F400AA511B")  # Turn on feed-in limitation
-        msg1resp = msg1.get("data")
-        if msg1resp == "010679F400AA511B":
-            logging.debug("Feed-in limitation enabled")
+        success, msg1resp = self._get_device_data_response(msg1, "enabling feed-in limitation")
+        if not success:
+            return False
+        elif msg1resp == "010679F400AA511B":
+            self.logger.debug("Feed-in limitation enabled")
         else:
-            logging.warning("Problem enabling feed-in limitation")
+            self.logger.warning(f"Problem enabling feed-in limitation, response was {msg1resp!r} (expected: 010679F400AA511B)")
             return False
 
         exportLimitCommand = self._generateExportLimitCommand(dekawattLimit)
-        logging.debug(f"Generated modbus export limit command as {exportLimitCommand}")
+        self.logger.debug(f"Generated modbus export limit command as {exportLimitCommand}")
         msg2 = self._sendHexMessageToDevice(exportLimitCommand)  # Set limit
-        msg2resp = msg2.get("data")
-        if msg2resp == exportLimitCommand:
-            logging.debug(f"Feed-in limitation set at {dekawattLimit/100}kW")
+        success, msg2resp = self._get_device_data_response(msg2, f"setting feed-in limitation to {dekawattLimit/100}kW")
+        if not success:
+            return False
+        elif msg2resp == exportLimitCommand:
+            self.logger.debug(f"Feed-in limitation set at {dekawattLimit/100}kW")
         else:
-            logging.warning(f"Problem setting feed-in limitation to {dekawattLimit/100}kW, modbus response was {msg2resp}")
+            self.logger.warning(f"Problem setting feed-in limitation to {dekawattLimit/100}kW, modbus response was {msg2resp!r} (expected: {exportLimitCommand})")
             return False
         return True
 
@@ -368,11 +396,13 @@ class SungrowHttpConfig():
         :returns: True if successful
         """
         msg1 = self._sendHexMessageToDevice("010679F40055115B") # Turn off feedin limitation
-        msg1resp = msg1.get("data")
-        if msg1resp == "010679F40055115B":
-            logging.debug("Feed-in limitation disabled")
+        success, msg1resp = self._get_device_data_response(msg1, "disabling feed-in limitation")
+        if not success:
+            return False
+        elif msg1resp == "010679F40055115B":
+            self.logger.debug("Feed-in limitation disabled")
         else:
-            logging.warning("Problem disabling feed-in limitation")
+            self.logger.warning(f"Problem disabling feed-in limitation, response was {msg1resp!r} (expected: 010679F40055115B)")
             return False
         return True
 
@@ -386,7 +416,7 @@ class SungrowHttpConfig():
             msg1resp = msg1.get("data")
             registers = self._decodeModbusExportLimitPayload(msg1resp)
             if len(registers) == 0:
-                logging.warning("No registers received in modbus reply, calling connect")
+                self.logger.warning("No registers received in modbus reply, calling connect")
                 self.connect()
 
         if (registers[0] == 341 or registers[0] == 85):  # Feed-in limitation is disabled
@@ -404,7 +434,7 @@ class SungrowHttpConfig():
     )
     def _execute_modbus_operation(self, operation_name, *args, **kwargs):
         """Execute a Modbus operation with retry handling
-        
+
         :param operation_name: The name of the Modbus client method to call (e.g., 'read_holding_registers')
         :param args: Arguments to pass to the operation function
         :param kwargs: Keyword arguments to pass to the operation function
@@ -414,25 +444,25 @@ class SungrowHttpConfig():
         try:
             # Ensure we have a connection
             if not self.client or not self.client.is_socket_open():
-                logging.debug("Modbus connection not open, reconnecting...")
+                self.logger.debug("Modbus connection not open, reconnecting...")
                 self._modbus_connect()
-                
+
             if not self.client:
                 raise ConnectionException("Failed to establish Modbus connection")
-                
+
             # Get the operation function from the client
             if not hasattr(self.client, operation_name):
                 raise AttributeError(f"Modbus client has no method named '{operation_name}'")
-                
+
             operation_func = getattr(self.client, operation_name)
-                
+
             # Execute the operation
             result = operation_func(*args, **kwargs)
-            
+
             # Check if the result indicates an error
             if hasattr(result, 'isError') and result.isError():
                 error_msg = f"Modbus operation failed: {result}"
-                logging.warning(error_msg)
+                self.logger.warning(error_msg)
                 # Reconnect and retry
                 self._modbus_connect()
                 if not self.client:
@@ -441,41 +471,41 @@ class SungrowHttpConfig():
                 result = operation_func(*args, **kwargs)
                 if result.isError():
                     raise Exception(error_msg)
-                    
+
             return result
-            
+
         except ConnectionException as e:
-            logging.warning(f"Modbus connection exception: {str(e)}")
+            self.logger.warning(f"Modbus connection exception: {str(e)}")
             # Force reconnection on next attempt
             if self.client:
                 self.client.close()
                 self.client = None
             raise
         except ModbusIOException as e:
-            logging.warning(f"Modbus I/O exception: {str(e)}")
+            self.logger.warning(f"Modbus I/O exception: {str(e)}")
             # Force reconnection on next attempt
             if self.client:
                 self.client.close()
                 self.client = None
             raise
         except OSError as e:
-            logging.warning(f"OS error during Modbus operation: {str(e)}")
+            self.logger.warning(f"OS error during Modbus operation: {str(e)}")
             # Force reconnection on next attempt
             if self.client:
                 self.client.close()
                 self.client = None
             raise
         except AttributeError as e:
-            logging.error(f"Attribute error during Modbus operation: {str(e)}")
+            self.logger.error(f"Attribute error during Modbus operation: {str(e)}")
             # Force reconnection on next attempt
             if self.client:
                 self.client.close()
                 self.client = None
             raise
         except Exception as e:
-            logging.error(f"Unexpected error during Modbus operation: {str(e)}")
+            self.logger.error(f"Unexpected error during Modbus operation: {str(e)}")
             raise
-            
+
     def _modbus_connect(self):
         """ Connect to the inverter using direct Modbus TCP
         :returns: True if successful
@@ -489,16 +519,16 @@ class SungrowHttpConfig():
         try:
             if self.client is None:
                 self.client = SungrowModbusTcpClient.SungrowModbusTcpClient(**client_config)
-            
+
             self.client.connect()
-            
+
             # Wait 3 seconds after connecting to fix timing issues
             import time
             time.sleep(3)
 
             return True
         except Exception as e:
-            logging.error(f"Error connecting to Modbus server: {str(e)}")
+            self.logger.error(f"Error connecting to Modbus server: {str(e)}")
             raise
 
     def _modbus_set_export_limit(self, dekawattLimit):
@@ -514,17 +544,17 @@ class SungrowHttpConfig():
                 'write_register',
                 31220, 0xAA, **kwargs
             )
-            
+
             # Register 31221 (0x79F5) - Set export limit value
             self._execute_modbus_operation(
                 'write_register',
                 31221, dekawattLimit, **kwargs
             )
-                
-            logging.debug(f"Feed-in limitation set at {dekawattLimit/100}kW")
+
+            self.logger.debug(f"Feed-in limitation set at {dekawattLimit/100}kW")
             return True
         except Exception as e:
-            logging.warning(f"Problem setting feed-in limitation: {str(e)}")
+            self.logger.warning(f"Problem setting feed-in limitation: {str(e)}")
             return False
 
     def _modbus_unset_export_limit(self):
@@ -539,11 +569,11 @@ class SungrowHttpConfig():
                 'write_register',
                 31220, 0x55, **kwargs
             )
-                
-            logging.debug("Feed-in limitation disabled")
+
+            self.logger.debug("Feed-in limitation disabled")
             return True
         except Exception as e:
-            logging.warning(f"Problem disabling feed-in limitation: {str(e)}")
+            self.logger.warning(f"Problem disabling feed-in limitation: {str(e)}")
             return False
 
     def _modbus_get_current_export_limit(self):
@@ -558,7 +588,7 @@ class SungrowHttpConfig():
                 'read_holding_registers',
                 31220, **kwargs
             )
-                
+
             if result.registers[0] == 0x55 or result.registers[0] == 341:  # Feed-in limitation is disabled
                 return 0
             elif result.registers[0] == 0xAA:  # Feed-in limitation is enabled
@@ -566,5 +596,5 @@ class SungrowHttpConfig():
             else:
                 raise Exception(f"Unknown response to query for current export limit: register value {result.registers[0]}")
         except Exception as e:
-            logging.error(f"Failed to read export limit status: {str(e)}")
+            self.logger.error(f"Failed to read export limit status: {str(e)}")
             raise
